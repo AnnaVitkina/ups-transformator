@@ -8,7 +8,9 @@ Used for PDF-style ``AdditionalCostsPart1`` / ``AdditionalCostsPart2`` and for
 Reference list (column ``Name`` in .xlsx / .csv):
   - Resolved from ``metadata.client``: any file in the search folders whose **stem**
     matches the client (substring or token-style match — see ``_client_matches_accessorial_ref_filename``).
-  - Search order: optional ``accessorial_folder``, then ``addition/Accessorial Costs``,
+  - Search order: optional ``accessorial_folder`` argument, then paths from the
+    ``UPS_ACCESSORIAL_FOLDER`` environment variable (``os.pathsep``-separated list),
+    then :data:`FALLBACK_ACCESSORIAL_FOLDER` if set, then ``addition/Accessorial Costs``,
     then ``addition/`` (next to this file).
 
 Public:
@@ -23,8 +25,15 @@ ACCESSORIAL_MATCH_MIN_SCORE = 0.35
 ACCESSORIAL_MATCH_MIN_MARGIN = 0.06
 
 import difflib
+import os
 import re
 from pathlib import Path
+
+# Optional: single folder to search (after ``accessorial_folder``). Team Colab default
+# below; override with ``UPS_ACCESSORIAL_FOLDER`` or clear to "" for local-only runs.
+FALLBACK_ACCESSORIAL_FOLDER: str = (
+    "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT UPS/addition/Accessorial Costs"
+)
 
 # Known currency codes (most popular) — used to detect and strip currency from Cost Price
 CURRENCY_CODES = frozenset({
@@ -90,6 +99,44 @@ def _clean_currency_and_price(raw_price, raw_currency):
     return cleaned_price, currency_code
 
 
+def _normalize_client_for_accessorial_match(client: str) -> str:
+    """
+    Strip suffixes that appear in rate-card metadata but not in reference filenames.
+
+    Examples: ``\"ASICS    - 2020\"`` → ``\"ASICS\"`` so ``\"asics\"`` can match
+    ``ASICS_Accessorial.xlsx`` (full client string is no longer required to be a
+    substring of the stem).
+    """
+    c = (client or "").strip()
+    if not c:
+        return c
+    # Trailing " - 2020", " – 2020", " -2020" (common client + validity year labels)
+    c = re.sub(r"\s*[-–]\s*\d{4}\s*$", "", c, flags=re.IGNORECASE).strip()
+    return c
+
+
+def _extra_accessorial_search_dirs() -> list[Path]:
+    """Paths from env / module fallback, in order, de-duplicated."""
+    out: list[Path] = []
+    seen: set[str] = set()
+
+    def _add(raw: str) -> None:
+        raw = (raw or "").strip()
+        if not raw:
+            return
+        p = Path(raw)
+        key = str(p.resolve()) if p.exists() else str(p)
+        if key not in seen:
+            seen.add(key)
+            out.append(p)
+
+    env = os.environ.get("UPS_ACCESSORIAL_FOLDER") or ""
+    for part in env.split(os.pathsep):
+        _add(part)
+    _add(FALLBACK_ACCESSORIAL_FOLDER)
+    return out
+
+
 def _client_matches_accessorial_ref_filename(client: str, file_stem: str) -> bool:
     """
     True if ``file_stem`` plausibly belongs to this client (for picking the approved list file).
@@ -99,8 +146,9 @@ def _client_matches_accessorial_ref_filename(client: str, file_stem: str) -> boo
       2. Alphanumeric prefix of client (first 12 chars) appears inside alphanumeric stem.
       3. At least two significant tokens (length ≥ 3, not pure digits) from the client
          each appear as substrings in the stem (e.g. ``assa`` + ``abloy`` in ``Assa_Abloy_Accessorial``).
+      4. A single significant token (length ≥ 4) appears in the stem (covers short names like ``ASICS``).
     """
-    c = (client or "").strip()
+    c = _normalize_client_for_accessorial_match(client)
     if not c:
         return False
     cl = c.lower()
@@ -119,7 +167,7 @@ def _client_matches_accessorial_ref_filename(client: str, file_stem: str) -> boo
     if len(tokens) >= 2:
         if all(t in st for t in tokens[:2]):
             return True
-    if len(tokens) == 1 and len(tokens[0]) >= 6 and tokens[0] in st:
+    if len(tokens) == 1 and len(tokens[0]) >= 4 and tokens[0] in st:
         return True
     return False
 
@@ -370,8 +418,9 @@ def build_accessorial_costs_rows(
 
     Cost Type fuzzy match:
       - Loads approved names from a reference file (column ``Name``) chosen by ``metadata.client``:
-        first matching file in ``accessorial_folder``, then ``addition/Accessorial Costs/``,
-        then ``addition/`` (see ``_client_matches_accessorial_ref_filename``).
+        first matching file in ``accessorial_folder`` (if passed), then ``UPS_ACCESSORIAL_FOLDER`` /
+        :data:`FALLBACK_ACCESSORIAL_FOLDER`, then ``addition/Accessorial Costs/``, then ``addition/``
+        (see ``_client_matches_accessorial_ref_filename``).
 
     Returns: ``(list_of_rows, path_of_reference_file_used_or_None)``
     """
@@ -412,8 +461,9 @@ def build_accessorial_costs_rows(
     # Find the reference file for Cost Type fuzzy matching.
     # Search order:
     #   1. accessorial_folder (if set)
-    #   2. addition/Accessorial Costs/
-    #   3. addition/
+    #   2. UPS_ACCESSORIAL_FOLDER (env) and FALLBACK_ACCESSORIAL_FOLDER (module constant)
+    #   3. addition/Accessorial Costs/
+    #   4. addition/
     # Filename must match metadata.client (see _client_matches_accessorial_ref_filename).
     # -----------------------------------------------------------------------
     if cost_type_ref_path is None:
@@ -423,6 +473,9 @@ def build_accessorial_costs_rows(
         search_dirs: list[Path] = []
         if accessorial_folder:
             search_dirs.append(Path(accessorial_folder))
+        for d in _extra_accessorial_search_dirs():
+            if d not in search_dirs:
+                search_dirs.append(d)
         local_addition = Path(__file__).resolve().parent / 'addition'
         local_accessorial_costs = local_addition / 'Accessorial Costs'
         for d in (local_accessorial_costs, local_addition):
