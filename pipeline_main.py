@@ -39,13 +39,16 @@ from pathlib import Path   # cross-platform file path handling
 #   - Local paths: used when running on a local Windows machine
 
 # --- Google Drive paths (Colab legacy defaults; none of these are required) ---
-HARDCODED_INPUT_FOLDER = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT UPS/input"
-HARDCODED_ARCHIVE_FOLDER = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT UPS/archive"
+HARDCODED_INPUT_FOLDER = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT/input json"
+HARDCODED_ARCHIVE_FOLDER = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT/archive"
 # Optional: only used when CLIENTS_FILE / --clients-file is unset and the file exists on Drive.
-HARDCODED_CLIENTS_FILE = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT UPS/addition/clients.txt"
+HARDCODED_CLIENTS_FILE = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT/addition/clients.txt"
 # Optional: only used when COUNTRY_CODES_FILE / --country-codes-file is unset and the file exists.
-HARDCODED_COUNTRY_CODES_FILE = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT UPS/addition/dhl_country_codes.txt"
-HARDCODED_OUTPUT_DIR = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT UPS/output"
+HARDCODED_COUNTRY_CODES_FILE = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT/addition/dhl_country_codes.txt"
+HARDCODED_OUTPUT_DIR = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT/output"
+# Optional: Cost Type reference .xlsx/.csv (column "Name") for the Accessorial Costs tab.
+# Team Drive layout (RMT UPS); override with UPS_ACCESSORIAL_FOLDER or --accessorial-folder if needed.
+HARDCODED_ACCESSORIAL_FOLDER = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT UPS/addition/Accessorial Costs"
 
 # --- Local Windows fallbacks (used when Drive is not mounted). Files are optional. ---
 LOCAL_INPUT_FOLDER = r"C:\Users\avitkin\.cursor\projects_folders\RMT\ups-transformation\input"
@@ -53,6 +56,7 @@ LOCAL_ARCHIVE_FOLDER = r"C:\Users\avitkin\.cursor\projects_folders\RMT\ups-trans
 LOCAL_CLIENTS_FILE = r"C:\Users\avitkin\.cursor\projects_folders\RMT\ups-transformation\addition\clients.txt"
 LOCAL_COUNTRY_CODES_FILE = r"C:\Users\avitkin\.cursor\projects_folders\RMT\ups-transformation\addition\dhl_country_codes.txt"
 LOCAL_OUTPUT_DIR = r"C:\Users\avitkin\.cursor\projects_folders\RMT\ups-transformation\output"
+LOCAL_ACCESSORIAL_FOLDER = r"C:\Users\avitkin\.cursor\projects_folders\RMT\ups-transformation\addition\Accessorial Costs"
 
 
 def _drive_available():
@@ -314,6 +318,7 @@ def parse_args():
       --clients-file      path to the clients.txt file (one client name per line)
       --country-codes-file path to the country code lookup file
       --output-dir        where to save the Excel and TXT output files
+      --accessorial-folder folder with client Cost Type reference .xlsx/.csv (column "Name")
       --verbose           show full debug output from all sub-steps
     """
     parser = argparse.ArgumentParser(
@@ -348,6 +353,12 @@ def parse_args():
         "--output-dir",
         default=None,
         help="Directory to write outputs (xlsx, txt). Extracted JSON is saved to processing/.",
+    )
+    parser.add_argument(
+        "--accessorial-folder",
+        default=None,
+        help="Folder with approved Cost Type lists (.xlsx/.csv, column Name). "
+        "Overrides UPS_ACCESSORIAL_FOLDER. Default: team Drive path or local addition/Accessorial Costs.",
     )
     parser.add_argument(
         "--verbose",
@@ -510,6 +521,7 @@ def run_pipeline(
     input_folder=None,
     archive_folder=None,
     verbose=False,
+    accessorial_folder=None,
 ):
     """
     Execute the full end-to-end pipeline for one Rate Card workbook or extracted JSON.
@@ -532,6 +544,8 @@ def run_pipeline(
       archive_folder      – where to move the input file after processing
       verbose             – if True, print all debug output from sub-steps;
                             if False, only print summary lines (errors are still shown)
+      accessorial_folder  – optional folder for Cost Type reference files (column Name);
+                            default: UPS_ACCESSORIAL_FOLDER env, then team Drive / local paths
     """
     # -----------------------------------------------------------------------
     # Resolve all file paths: fill in any None values from env vars or defaults,
@@ -595,6 +609,23 @@ def run_pipeline(
         if archive_folder:
             archive_folder = _use_drive_or_local(archive_folder, LOCAL_ARCHIVE_FOLDER, is_dir=True)
 
+    # Accessorial Cost Type lists (optional): prefer explicit arg, then env, then Drive/local defaults.
+    if accessorial_folder is None:
+        accessorial_folder = os.environ.get("UPS_ACCESSORIAL_FOLDER")
+    if accessorial_folder is None:
+        accessorial_folder = HARDCODED_ACCESSORIAL_FOLDER
+    accessorial_folder = (accessorial_folder or "").strip() or None
+    if accessorial_folder:
+        resolved = _use_drive_or_local(accessorial_folder, LOCAL_ACCESSORIAL_FOLDER, is_dir=True)
+        p_acc = Path(resolved)
+        if p_acc.is_dir():
+            accessorial_folder = str(p_acc.resolve())
+        else:
+            _proj_ac = PROJECT_ROOT / "addition" / "Accessorial Costs"
+            accessorial_folder = (
+                str(_proj_ac.resolve()) if _proj_ac.is_dir() else None
+            )
+
     # Create the output and processing folders if they don't already exist
     output_root = Path(output_dir) if output_dir else (PROJECT_ROOT / "output")
     output_root.mkdir(parents=True, exist_ok=True)
@@ -643,6 +674,14 @@ def run_pipeline(
         print(f"[*] Country codes file: {country_codes_file}")
     print(f"[*] Output directory: {output_root}")
     print(f"[*] Processing directory: {processing_root}")
+    if accessorial_folder:
+        print(f"[*] Accessorial Cost Type folder (first search path): {accessorial_folder}")
+    else:
+        print(
+            "[*] Accessorial Cost Type folder: (not set — using env "
+            "UPS_ACCESSORIAL_FOLDER / accessorial_costs.FALLBACK_ACCESSORIAL_FOLDER / "
+            "addition next to accessorial_costs.py)"
+        )
     if input_folder:
         print(f"[*] Input folder: {input_folder}")
     if archive_folder:
@@ -679,6 +718,7 @@ def run_pipeline(
     _list_folder("INPUT  folder", input_folder or PROJECT_ROOT / "input")
     _list_folder("ARCHIVE folder", archive_folder or PROJECT_ROOT / "archive")
     _list_folder("OUTPUT  folder", output_root)
+    _list_folder("ACCESSORIAL ref folder", accessorial_folder)
     print("[DEBUG] ---- End folder listing ----")
     print()
 
@@ -764,8 +804,33 @@ def run_pipeline(
     # -----------------------------------------------------------------------
     print("Step 4: Creating Excel workbook...")
     output_xlsx_path.parent.mkdir(parents=True, exist_ok=True)
-    _run_quiet("Create Excel", create_table.save_to_excel, processed_data, str(output_xlsx_path))
+    excel_summary = _run_quiet(
+        "Create Excel",
+        create_table.save_to_excel,
+        processed_data,
+        str(output_xlsx_path),
+        accessorial_folder=accessorial_folder,
+    )
     print(f"[OK] Excel created: {output_xlsx_path}")
+    acc = (excel_summary or {}).get("accessorial")
+    if acc is not None:
+        n = acc.get("rows", 0)
+        ref = acc.get("reference_file")
+        if acc.get("sheet_written"):
+            if ref:
+                print(
+                    f"[OK] Accessorial Costs tab: {n} row(s); "
+                    f"Cost Type list from {ref}"
+                )
+            else:
+                print(
+                    f"[OK] Accessorial Costs tab: {n} row(s); "
+                    "no client-matching reference file (Cost Type may be empty)"
+                )
+        else:
+            print(
+                "[*] Accessorial builder: 0 rows (Accessorial Costs tab not added)"
+            )
     print()
 
     # -----------------------------------------------------------------------
@@ -872,6 +937,7 @@ def main():
         input_folder=selected_folder or args.input_folder,
         archive_folder=args.archive_folder,
         verbose=args.verbose,
+        accessorial_folder=args.accessorial_folder,
     )
 
 
