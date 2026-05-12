@@ -70,8 +70,17 @@ def create_metadata_sheet(workbook, metadata):
     print("[OK] Metadata tab created")
 
 
-def save_to_excel(data, output_path):
-    """Write workbook to ``output_path``."""
+def save_to_excel(data, output_path, accessorial_folder=None):
+    """Write workbook to ``output_path``.
+
+    ``accessorial_folder`` is passed to ``accessorial_costs.build_accessorial_costs_rows`` as the
+    first directory to search for client Cost Type reference files (optional).
+
+    Returns a summary dict. When accessorial sources exist, includes
+    ``accessorial``: ``rows``, ``reference_file``, ``sheet_written`` (from
+    ``accessorial_costs.build_accessorial_costs_rows``) so callers can log
+    mapping status without relying on captured stdout.
+    """
     print(f"[*] Creating Excel file: {output_path}")
 
     try:
@@ -81,6 +90,7 @@ def save_to_excel(data, output_path):
         raise
 
     try:
+        excel_build_summary: dict = {}
         wb = openpyxl.Workbook()
         wb.remove(wb.active)
 
@@ -167,12 +177,18 @@ def save_to_excel(data, output_path):
         if ac_part1 or ac_part2 or accessorial_costs_2:
             from accessorial_costs import build_accessorial_costs_rows
 
-            ac_rows, _ref = build_accessorial_costs_rows(
+            ac_rows, ref_used = build_accessorial_costs_rows(
                 ac_part1,
                 ac_part2,
                 metadata,
+                accessorial_folder=accessorial_folder,
                 accessorial_costs_2_toolbox=accessorial_costs_2 or None,
             )
+            excel_build_summary["accessorial"] = {
+                "rows": len(ac_rows),
+                "reference_file": str(ref_used) if ref_used else None,
+                "sheet_written": bool(ac_rows),
+            }
             if ac_rows:
                 write_accessorial_sheet(wb, "Accessorial Costs", ac_rows)
 
@@ -212,6 +228,8 @@ def save_to_excel(data, output_path):
         print(f"[OK] Excel file saved successfully")
         print(f"  - Tabs: {len(wb.sheetnames)}")
         print(f"  - File size: {file_size_kb:.2f} KB")
+
+        return excel_build_summary
 
     except Exception as e:
         print(f"[ERROR] Failed to save Excel: {e}")
