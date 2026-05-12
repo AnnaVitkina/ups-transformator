@@ -39,7 +39,7 @@ from pathlib import Path   # cross-platform file path handling
 #   - Local paths: used when running on a local Windows machine
 
 # --- Google Drive paths (Colab legacy defaults; none of these are required) ---
-HARDCODED_INPUT_FOLDER = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT UPS/input json"
+HARDCODED_INPUT_FOLDER = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT UPS/input"
 HARDCODED_ARCHIVE_FOLDER = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT UPS/archive"
 # Optional: only used when CLIENTS_FILE / --clients-file is unset and the file exists on Drive.
 HARDCODED_CLIENTS_FILE = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT UPS/addition/clients.txt"
