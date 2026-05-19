@@ -209,21 +209,26 @@ def _zone_sort_key(zone_name):
     Without this, alphabetical sorting would give: Zone 1, Zone 10, Zone 2 (wrong).
     With this, we get: Zone 1, Zone 2, Zone 10, Zone A (correct).
 
+    UPS toolbox labels (e.g. ``TB\\n4``, ``WW\\n706``) use the last line for a numeric
+    sort when possible; otherwise they sort alphabetically in group 1.
+
     Returns a tuple (group, value) where:
-      group=0 means numeric zone (sorted by number)
-      group=1 means letter/other zone (sorted after all numeric zones)
+      group=0 means numeric zone (sorted by number as float)
+      group=1 means letter/other zone (sorted by str; never mix int/str in value)
     """
     s = (zone_name or '').strip()
     if not s:
-        return (1, 0)
+        return (1, '')
     if s.upper().startswith('ZONE '):
         suffix = s[5:].strip()
     else:
-        suffix = s
+        # UPS: "TB\n4", "WW\n754" — prefer trailing line for ordering
+        parts = [p.strip() for p in re.split(r'[\r\n]+', s) if p.strip()]
+        suffix = parts[-1] if parts else s
     try:
         return (0, float(suffix))
     except (ValueError, TypeError):
-        return (1, suffix)   # sort non-numeric zones alphabetically within group 1
+        return (1, suffix.lower())
 
 
 def global_country(metadata):
@@ -1210,7 +1215,10 @@ def build_matrix_main_costs(main_costs, metadata, zoning_matrix=None, country_zo
 
     carrier_last = global_country(metadata)
 
-    sorted_keys = sorted(lane_rows.keys(), key=lambda k: (k[0], _zone_sort_key(k[1])))
+    sorted_keys = sorted(
+        lane_rows.keys(),
+        key=lambda k: (k[0] or '', _zone_sort_key(k[1])),
+    )
 
     rows = []
     for lane, key in enumerate(sorted_keys, 1):
