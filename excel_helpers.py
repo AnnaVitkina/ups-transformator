@@ -9,7 +9,7 @@ on the sheet of that name when the JSON block is present; the **Accessorial Cost
 
 import re
 
-from transform_main_costs import MAIN_COSTS_SHIPMENT_COLS
+from transform_main_costs import MAIN_COSTS_SHIPMENT_COLS, row_has_matrix_prices_in_block
 
 
 def _range_weight_to_leq_display(weight_str):
@@ -197,7 +197,12 @@ def write_matrix_sheet(workbook, sheet_name, matrix_rows, category_specs, metada
         for start_col, end_col, cost_cat_name, weights, has_spacer in category_start_cols:
             col = start_col
             if has_spacer:
-                cell = ws.cell(row=row_idx, column=col, value=doc_currency)
+                currency_val = (
+                    doc_currency
+                    if row_has_matrix_prices_in_block(row_data, cost_cat_name, weights)
+                    else ''
+                )
+                cell = ws.cell(row=row_idx, column=col, value=currency_val)
                 cell.alignment = Alignment(horizontal="center")
                 col = start_col + 1
             for w in weights:
