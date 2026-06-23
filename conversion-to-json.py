@@ -8,6 +8,8 @@ Rules (per workbook):
     that is not Accessorial (including ZONE) is used so CountryZoning can still match.
   - **MainCosts** (and toolbox header metadata): only sheets whose name starts with
     ``{prefix} `` (same two letters + space), excluding names containing ``ZONE`` or ``ACCESSORIAL``.
+  - **Ignored pricing tabs** (per region prefix): CZ/BE and FR skip configured Sending/Receiving
+    rate sheets (see ``_IGNORED_PRICING_TABS_BY_REGION``).
   - Sheets whose name **starts with** the same **region prefix** and contains ``ZONE``
     supply ``CountryZoning``; if several match, **only the first** in workbook order is read.
   - From each matching sheet, take the **first** rate table only: ``Net Rates``-style
@@ -15,6 +17,9 @@ Rules (per workbook):
     ``Market + "\\n" + Zone`` per column in **Excel column order** (TB / WW / DOM in any
     order). The **Kg** / **Lbs** header column is detected when present; zone prices start
     in the column immediately to its right, and row weights are read from the Kg column.
+  - **Additional** UK/export grids (e.g. ``Weight`` | ``Kg`` | ``Zone 702`` …): when the
+    toolbox Market/Zone band is not found, a single header row with ``Zone NNN`` labels and
+    weight in the column left of ``Kg`` is parsed before the legacy sliding-window path.
   - Emit one MainCosts section per sheet: ``service_type`` (``Movement\\nService``, e.g.
     ``Receiving Rates\\nUPS Standard Multi`` when Movement/Service labels exist),
     ``cost_category``,
@@ -227,6 +232,32 @@ def _toolbox_movement_service_line(rows: list[list[str]], start_row: int, end_ex
                 service = s.split(":", 1)[1].strip()
     parts = [p for p in (movement.strip(), service.strip()) if p]
     return "\n".join(parts)
+
+
+def _correct_service_type_for_tab(
+    service_type: str, sheet_name: str, region_prefix: str | None
+) -> str:
+    """
+    Fix toolbox Service typos using the worksheet name.
+
+    Some AP tabs store ``UPS … Multi p`` instead of ``UPS … Multi AP`` in the Service cell
+    (e.g. tab ``CZ E-Std Multi AP``).
+    """
+    tab_suffix = _pricing_tab_suffix(sheet_name, region_prefix)
+    if not tab_suffix or not tab_suffix.rstrip().upper().endswith("AP"):
+        return service_type
+    st = (service_type or "").strip()
+    if not st:
+        return service_type
+    if "\n" in st:
+        movement, service = st.split("\n", 1)
+    else:
+        movement, service = "", st
+    service = service.strip()
+    if service.lower().endswith(" p"):
+        service = service[:-2] + " AP"
+        return f"{movement}\n{service}".strip("\n") if movement else service
+    return service_type
 
 
 def _toolbox_cell_value_after_label(row: list[str], col_idx: int, label_cell: str) -> str:
@@ -1375,6 +1406,183 @@ def extract_first_table_toolbox_layout(rows: list[list[str]], max_col: int = SHE
     }
 
 
+_ZONE_NUMBER_HEADER_RE = re.compile(r"^zone\s+(\d+)\s*$", re.I)
+
+# Product rows above numeric weight brackets (GB export Net Rates); not package tokens on data rows.
+_NET_RATES_PRODUCT_ROW_LABELS = frozenset(
+    {"envelope", "document", "doc", "env", "package"}
+)
+
+
+def _is_zone_number_header_cell(s: str) -> bool:
+    return bool(_ZONE_NUMBER_HEADER_RE.match((s or "").strip()))
+
+
+def _zone_number_header_width(row: list[str], c0: int, max_col: int) -> int:
+    w = 0
+    while c0 + w < len(row) and c0 + w < max_col:
+        if not _is_zone_number_header_cell(_cell_str(row[c0 + w])):
+            break
+        w += 1
+    return w
+
+
+def _find_net_rates_zone_number_header_band(
+    rows: list[list[str]], max_col: int = SHEET_MAX_COL
+) -> tuple[int, int, int, int, int] | None:
+    """
+    Locate ``Weight`` | (optional unit col) | ``Zone 702`` … header band (GB export layout).
+
+    Returns ``(header_row, zone_start, n_zones, weight_col, unit_col)`` or None.
+    """
+    net_r = _find_net_rates_row(rows)
+    r_lo = max(0, net_r) if net_r is not None else 0
+    r_hi = min(len(rows), r_lo + 80)
+
+    for r in range(r_lo, r_hi):
+        row = rows[r]
+        lim = min(len(row), max_col)
+        for c in range(lim):
+            if _cell_str(row[c]).strip().casefold() != "weight":
+                continue
+            for zstart in (c + 1, c + 2):
+                if zstart >= lim:
+                    continue
+                if zstart > c + 1 and not _cell_str(row[zstart - 1]).strip():
+                    pass
+                w = _zone_number_header_width(row, zstart, max_col)
+                if w < 4:
+                    continue
+                weight_col = c
+                unit_col = zstart - 1
+                if unit_col <= weight_col:
+                    unit_col = weight_col + 1
+                return r, zstart, w, weight_col, unit_col
+    return None
+
+
+def _build_zone_headers_from_zone_number_row(
+    row: list[str], zone_start: int, n: int
+) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for k in range(n):
+        v = _cell_str(row[zone_start + k]).strip()
+        out[f"Zone{k + 1}"] = v
+    return out
+
+
+def _try_parse_net_rates_weight_kg_row(
+    cells: list[str],
+    zone_start: int,
+    n_zones: int,
+    weight_col: int,
+    unit_col: int,
+) -> dict | None:
+    """
+    Parse one pricing row for the Weight | Kg | Zone NNN grid (weight in ``weight_col``,
+    unit label in ``unit_col``, prices from ``zone_start``).
+    """
+    cells = [_cell_str(c) for c in cells]
+    if zone_start + n_zones > len(cells):
+        return None
+
+    w_raw = cells[weight_col].strip() if weight_col < len(cells) else ""
+    u_raw = cells[unit_col].strip().casefold() if unit_col < len(cells) else ""
+    low_w = w_raw.lower()
+
+    if not w_raw:
+        return None
+    if low_w in _NET_RATES_PRODUCT_ROW_LABELS:
+        return None
+    if low_w in PACKAGE_ROW_COSTNAME_TOKENS and not _is_weight_token(w_raw):
+        return None
+
+    open_bracket = _toolbox_weight_open_bracket_display(w_raw)
+    if open_bracket is not None:
+        weight_out = open_bracket
+    elif not _is_weight_token(w_raw):
+        return None
+    else:
+        weight_out = _format_weight_display(w_raw)
+        if u_raw in ("kg", "kgs", "lb", "lbs") and not re.search(
+            r"\b(?:kg|kgs|lb|lbs)\b", weight_out, re.I
+        ):
+            weight_out = f"{weight_out} {u_raw}"
+
+    band = cells[zone_start : zone_start + n_zones]
+    zone_prices: dict[str, str] = {}
+    for idx, val in enumerate(band, start=1):
+        v = str(val).strip()
+        if not v:
+            continue
+        if _is_price_or_placeholder(v):
+            zone_prices[f"Zone{idx}"] = _format_price_cell(v)
+    if len(zone_prices) < 2:
+        return None
+
+    return {"weight": weight_out, "zone_prices": zone_prices}
+
+
+def extract_first_table_net_rates_zone_grid(rows: list[list[str]]) -> dict | None:
+    """
+    **Additional** extractor for export Net Rates sheets: one header row
+    ``Weight`` | ``Kg`` | ``Zone 702`` | ``Zone 703`` | … and numeric weights in the
+    weight column (not the legacy “first number in row” heuristic).
+    """
+    band = _find_net_rates_zone_number_header_band(rows)
+    if not band:
+        return None
+
+    header_r, zone_start, n, weight_col, unit_col = band
+    zone_headers = _build_zone_headers_from_zone_number_row(rows[header_r], zone_start, n)
+
+    net_r = _find_net_rates_row(rows)
+    st_start = net_r if net_r is not None else 0
+    banner_lo = max(0, header_r - 60)
+    mv = _toolbox_movement_service_line(rows, banner_lo, header_r).strip()
+    built = _build_service_type_lines(rows, header_r, start_row=st_start).strip()
+    if mv:
+        service_type = mv
+    elif built:
+        service_type = built
+    else:
+        service_type = "Receiving Rates"
+    if not service_type.strip():
+        service_type = "Receiving Rates"
+
+    cost_category = _section_cost_category(rows, header_r, zone_start)
+    weight_unit = _detect_weight_unit(rows, header_r)
+
+    pricing: list[dict] = []
+    for r in range(header_r + 1, len(rows)):
+        if _row_is_blank(rows[r]):
+            # Separator blank between Documents / Packages blocks — keep scanning.
+            continue
+        row_cells = rows[r]
+        blob = " ".join(_cell_str(x) for x in row_cells).lower()
+        if pricing and _cell_str(row_cells[weight_col]).strip().casefold() == "weight":
+            break
+        if pricing and "published rates" in blob:
+            break
+        pr = _try_parse_net_rates_weight_kg_row(
+            rows[r], zone_start, n, weight_col, unit_col
+        )
+        if not pr:
+            continue
+        pricing.append({"weight": pr["weight"], "zone_prices": pr["zone_prices"]})
+
+    if not pricing:
+        return None
+
+    return {
+        "service_type": service_type,
+        "cost_category": cost_category,
+        "weight_unit": weight_unit,
+        "zone_headers": zone_headers,
+        "pricing": pricing,
+    }
+
+
 def extract_first_main_costs_table_legacy(rows: list[list[str]]) -> dict | None:
     """
     Find the first contiguous UPS-style grid and return one MainCosts section dict,
@@ -1455,6 +1663,9 @@ def extract_first_main_costs_table(rows: list[list[str]]) -> dict | None:
     tb = extract_first_table_toolbox_layout(rows)
     if tb:
         return tb
+    zone_grid = extract_first_table_net_rates_zone_grid(rows)
+    if zone_grid:
+        return zone_grid
     return extract_first_main_costs_table_legacy(rows)
 
 
@@ -1494,6 +1705,143 @@ def sheet_matches_region_pricing_tab(name: str, region_prefix: str | None) -> bo
         return False
     p = region_prefix.strip().upper()
     return len(p) == 2 and u.startswith(p + " ")
+
+
+def _norm_pricing_tab_suffix(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+
+def _pricing_tab_suffix(sheet_name: str, region_prefix: str | None) -> str | None:
+    """Part of sheet name after ``{prefix} `` (e.g. ``E-Express Plus_ENV``)."""
+    if not region_prefix:
+        return None
+    p = region_prefix.strip().upper()
+    if len(p) != 2:
+        return None
+    raw = (sheet_name or "").strip()
+    prefix = p + " "
+    if not raw.upper().startswith(prefix):
+        return None
+    return _norm_pricing_tab_suffix(raw[len(prefix) :])
+
+
+def _ignored_pricing_tabs(*tab_suffixes: str) -> frozenset[str]:
+    return frozenset(_norm_pricing_tab_suffix(t) for t in tab_suffixes)
+
+
+# Czech Republic + Belgium: skip these pricing tabs during MainCosts extraction.
+_IGNORED_PRICING_TABS_CZ_BE = _ignored_pricing_tabs(
+    # Sending Rates
+    "E-Express Plus_ENV",
+    "E-Express Plus AP_ENV",
+    "E-Express Plus_DOC",
+    "E-Express Plus AP_DOC",
+    "E-Express Plus_PKG",
+    "E-Express Plus AP_PKG",
+    "E-Express_ENV",
+    "E-Express AP_ENV",
+    "E-Express_DOC1",
+    "E-Express AP_DOC",
+    "E-Express_PKG1",
+    "E-Express AP_PKG",
+    "E-WWE DDP",
+    "E-WWE DDU",
+    "E-APE Single",
+    "E-APE Multi",
+    "E-Expedited1",
+    "E-Expedited AP",
+    "E-WWEF",
+    "E-WWEF Mday",
+    # Receiving Rates
+    "I-Express Plus_ENV",
+    "I-Express Plus AP_ENV",
+    "I-Express Plus_DOC",
+    "I-Express Plus AP_DOC",
+    "I-Express Plus_PKG",
+    "I-Express Plus AP_PKG",
+    "I-Express_ENV",
+    "I-Express AP_ENV",
+    "I-Express_DOC1",
+    "I-Express AP_DOC",
+    "I-Express_PKG1",
+    "I-Express AP_PKG",
+    "I-WWE DDP",
+    "I-APE Single",
+    "I-APE Multi",
+    "I-Expedited1",
+    "I-Expedited AP",
+    "I-WWEF",
+    "I-WWEF Mday",
+)
+
+# France: skip these pricing tabs during MainCosts extraction.
+_IGNORED_PRICING_TABS_FR = _ignored_pricing_tabs(
+    # Sending Rates
+    "E-Express Plus_ENV",
+    "E-Express Plus AP_ENV",
+    "E-Express Plus_DOC",
+    "E-Express Plus AP_DOC",
+    "E-Express Plus_PKG",
+    "E-Express Plus AP_PKG",
+    "E-Express AP_ENV",
+    "E-Express AP_DOC",
+    "E-Express AP_PKG",
+    "E-Express Svr AP_ENV",
+    "E-Express Svr AP_DOC",
+    "E-Express Svr AP_PKG",
+    "E-WWE DDP",
+    "E-WWE DDU",
+    "E-Std Single AP",
+    "E-Std Multi AP",
+    "E-APE Single",
+    "E-APE Multi",
+    "E-Expedited",
+    "E-Expedited AP",
+    "E-WWEF",
+    "E-WWEF ToD",
+    # Receiving Rates
+    "I-Express Plus_ENV",
+    "I-Express Plus AP_ENV",
+    "I-Express Plus_DOC",
+    "I-Express Plus AP_DOC",
+    "I-Express Plus_PKG",
+    "I-Express Plus AP_PKG",
+    "I-Express AP_ENV",
+    "I-Express AP_DOC",
+    "I-Express AP_PKG",
+    "I-Express Svr AP_ENV",
+    "I-Express Svr AP_DOC",
+    "I-Express Svr AP_PKG",
+    "I-WWE DDP",
+    "I-WWE DDU",
+    "I-Std Single AP1",
+    "I-Std Single AP2",
+    "I-Std Multi AP1",
+    "I-Std Multi AP2",
+    "I-APE Single",
+    "I-APE Multi",
+    "I-Expedited",
+    "I-Expedited AP",
+    "I-WWEF",
+    "I-WWEF ToD",
+)
+
+_IGNORED_PRICING_TABS_BY_REGION: dict[str, frozenset[str]] = {
+    "CZ": _IGNORED_PRICING_TABS_CZ_BE,
+    "BE": _IGNORED_PRICING_TABS_CZ_BE,
+    "FR": _IGNORED_PRICING_TABS_FR,
+}
+
+
+def sheet_is_ignored_pricing_tab(sheet_name: str, region_prefix: str | None) -> bool:
+    """True when this region's configured ignore list contains the sheet's tab suffix."""
+    suffix = _pricing_tab_suffix(sheet_name, region_prefix)
+    if suffix is None:
+        return False
+    ignored = _IGNORED_PRICING_TABS_BY_REGION.get((region_prefix or "").strip().upper())
+    if not ignored:
+        return False
+    return suffix in ignored
 
 
 def sheet_matches_region_zones_tab(name: str, region_prefix: str | None) -> bool:
@@ -2167,10 +2515,15 @@ def default_input_search_hint(project_root: Path) -> str:
     )
 
 
-def _main_cost_section_ordered(section: dict, sheet_name: str) -> dict:
+def _main_cost_section_ordered(
+    section: dict, sheet_name: str, region_prefix: str | None = None
+) -> dict:
     """Build MainCosts section dict with ``tab_name`` immediately before ``zone_headers``."""
+    service_type = _correct_service_type_for_tab(
+        section.get("service_type", ""), sheet_name, region_prefix
+    )
     return {
-        "service_type": section.get("service_type", ""),
+        "service_type": service_type,
         "cost_category": section.get("cost_category", ""),
         "weight_unit": section.get("weight_unit", ""),
         "tab_name": sheet_name,
@@ -2190,13 +2543,15 @@ def _collect_main_costs_from_openpyxl(
         for sheet_name in wb.sheetnames:
             if not sheet_matches_region_pricing_tab(sheet_name, region_prefix):
                 continue
+            if sheet_is_ignored_pricing_tab(sheet_name, region_prefix):
+                continue
             ws = wb[sheet_name]
             rows = _sheet_to_rows_openpyxl(ws)
             section = extract_first_main_costs_table(rows)
             if not section:
                 print(f"[WARN] No first pricing table parsed on sheet {sheet_name!r} (skipped)")
                 continue
-            main_costs.append(_main_cost_section_ordered(section, sheet_name))
+            main_costs.append(_main_cost_section_ordered(section, sheet_name, region_prefix))
     finally:
         wb.close()
     return main_costs
@@ -2218,13 +2573,15 @@ def _collect_main_costs_from_pyxlsb(
         for sheet_name in wb.sheets:
             if not sheet_matches_region_pricing_tab(sheet_name, region_prefix):
                 continue
+            if sheet_is_ignored_pricing_tab(sheet_name, region_prefix):
+                continue
             with wb.get_sheet(sheet_name) as sheet:
                 rows = _sheet_to_rows_pyxlsb(sheet)
             section = extract_first_main_costs_table(rows)
             if not section:
                 print(f"[WARN] No first pricing table parsed on sheet {sheet_name!r} (skipped)")
                 continue
-            main_costs.append(_main_cost_section_ordered(section, sheet_name))
+            main_costs.append(_main_cost_section_ordered(section, sheet_name, region_prefix))
     return main_costs
 
 
