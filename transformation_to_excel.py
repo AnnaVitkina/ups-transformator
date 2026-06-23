@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 
 from transform_main_costs import (
+    apply_country_iso_codes_to_main_costs,
     apply_zone_labels_to_main_costs,
     build_matrix_main_costs,
     expand_main_costs_lanes_by_zoning,
@@ -110,6 +111,7 @@ def save_to_excel(data, output_path, accessorial_folder=None):
                 zone_label_lookup = build_zone_label_lookup(country_zoning)
                 matrix_rows = apply_zone_labels_to_main_costs(matrix_rows, zone_label_lookup)
             matrix_rows = sort_main_costs_rows_for_layout(matrix_rows)
+            matrix_rows = apply_country_iso_codes_to_main_costs(matrix_rows, metadata)
             write_matrix_sheet(wb, "MainCosts", matrix_rows, category_specs, metadata)
 
         added_rates = data.get('AddedRates', [])
