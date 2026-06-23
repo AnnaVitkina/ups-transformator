@@ -5,7 +5,9 @@ Typical source JSON: ``processing/from_rate_card_excel.json`` (see ``conversion-
 
 Public: ``build_matrix_main_costs``, ``expand_main_costs_lanes_by_zoning``,
 ``apply_zone_labels_to_main_costs``, ``sort_main_costs_rows_for_layout``,
-``global_country``, ``parse_zoning_matrix``, ``MAIN_COSTS_SHIPMENT_COLS``,
+``apply_country_iso_codes_to_main_costs``, ``apply_matrix_price_fill_rules``,
+``global_country``, ``country_name_to_iso_code``,
+``parse_zoning_matrix``, ``MAIN_COSTS_SHIPMENT_COLS``,
 ``pivot_main_costs`` (legacy flat table).
 """
 
@@ -25,8 +27,210 @@ MAIN_COSTS_SHIPMENT_COLS = [
     'Destination Country',
     'Destination Postal Code Zone',
     'Original Service',
+    'Service type',
     'Zone',
 ]
+
+
+# Built-in ISO codes for UPS toolbox countries (merged with dhl_country_codes.txt when present).
+_BUILTIN_COUNTRY_NAME_TO_ISO = {
+    'Czech Republic': 'CZ',
+    'Belgium': 'BE',
+    'France': 'FR',
+    'Sweden': 'SE',
+    'Germany': 'DE',
+    'Netherlands': 'NL',
+    'United Kingdom': 'GB',
+    'Great Britain': 'GB',
+    'Italy': 'IT',
+    'Spain': 'ES',
+    'Poland': 'PL',
+    'Austria': 'AT',
+    'Switzerland': 'CH',
+    'Denmark': 'DK',
+    'Norway': 'NO',
+    'Finland': 'FI',
+    'Portugal': 'PT',
+    'Ireland': 'IE',
+    'Luxembourg': 'LU',
+    'Hungary': 'HU',
+    'Slovakia': 'SK',
+    'Slovenia': 'SI',
+    'Romania': 'RO',
+    'Bulgaria': 'BG',
+    'Greece': 'GR',
+    'Croatia': 'HR',
+    'Estonia': 'EE',
+    'Latvia': 'LV',
+    'Lithuania': 'LT',
+}
+
+_COUNTRY_NAME_TO_ISO_CACHE: dict[str, str] | None = None
+
+
+def _country_name_to_iso_lookup() -> dict[str, str]:
+    global _COUNTRY_NAME_TO_ISO_CACHE
+    if _COUNTRY_NAME_TO_ISO_CACHE is None:
+        merged = dict(_BUILTIN_COUNTRY_NAME_TO_ISO)
+        try:
+            from transform_other_tabs import _load_country_codes
+
+            merged.update(_load_country_codes())
+        except Exception:
+            pass
+        _COUNTRY_NAME_TO_ISO_CACHE = merged
+    return _COUNTRY_NAME_TO_ISO_CACHE
+
+
+def country_name_to_iso_code(country: str) -> str:
+    """Resolve a country name (or existing code) to a 2-letter ISO code when possible."""
+    s = (country or '').strip()
+    if not s:
+        return ''
+    if re.fullmatch(r'[A-Za-z]{2}', s):
+        return s.upper()
+    name_to_code = _country_name_to_iso_lookup()
+    try:
+        from transform_other_tabs import _country_to_code
+
+        code = _country_to_code(s, name_to_code)
+        if code:
+            return code.split(',')[0].strip().upper()
+    except Exception:
+        pass
+    for key, code in _BUILTIN_COUNTRY_NAME_TO_ISO.items():
+        if key.lower() == s.lower():
+            return code
+    return ''
+
+
+def global_country_iso(metadata) -> str:
+    """Carrier country as a 2-letter ISO code (falls back to empty when unknown)."""
+    return country_name_to_iso_code(global_country(metadata))
+
+
+def apply_country_iso_codes_to_main_costs(matrix_rows, metadata=None) -> list:
+    """Ensure **Origin Country** / **Destination Country** use ISO codes where known."""
+    if not matrix_rows:
+        return matrix_rows
+    carrier_code = global_country_iso(metadata) if metadata else ''
+    for row in matrix_rows:
+        for col in ('Origin Country', 'Destination Country'):
+            val = (row.get(col) or '').strip()
+            if not val:
+                continue
+            code = country_name_to_iso_code(val)
+            if code:
+                row[col] = code
+            elif carrier_code and val == global_country(metadata or {}):
+                row[col] = carrier_code
+    return matrix_rows
+
+
+# Original Service (UPS product name) → Service type column value.
+_ORIGINAL_SERVICE_TO_SERVICE_TYPE = {
+    'UPS Standard Single': 'STANDARD Single',
+    'UPS Standard Single AP': 'STANDARD Single_AP',
+    'UPS Standard Multi': 'STANDARD Multi',
+    'UPS Standard Multi AP': 'STANDARD Multi_AP',
+    'UPS Express': 'EXPRESS',
+    'UPS Express AP': 'EXPRESS_AP',
+    'UPS Express Saver': 'EXPRESS SAVER',
+    'UPS Express Saver AP': 'EXPRESS SAVER_AP',
+}
+_ORIGINAL_SERVICE_TO_SERVICE_TYPE_NORM = {
+    ' '.join(k.split()).upper(): v for k, v in _ORIGINAL_SERVICE_TO_SERVICE_TYPE.items()
+}
+
+
+def _normalize_ups_service_name(name: str) -> str:
+    """Fix known UPS service typos from toolbox cells (e.g. ``Multi p`` → ``Multi AP``)."""
+    s = (name or '').strip()
+    if re.match(r'(?i)^UPS Standard Multi\s+p$', s):
+        return 'UPS Standard Multi AP'
+    return s
+
+
+def _normalize_ups_service_type(service_type: str) -> str:
+    st = (service_type or '').strip()
+    if not st:
+        return st
+    if '\n' in st:
+        movement, service = st.split('\n', 1)
+        service = _normalize_ups_service_name(service.strip())
+        return f"{movement}\n{service}" if movement.strip() else service
+    return _normalize_ups_service_name(st)
+
+
+def _ups_original_service_label(service_type: str) -> str:
+    """UPS product line from a MainCosts service_type (e.g. ``UPS Standard Single``)."""
+    st = _normalize_ups_service_type(service_type)
+    if not st:
+        return ''
+    if '\n' in st:
+        for line in st.splitlines():
+            line = line.strip()
+            if line.upper().startswith('UPS '):
+                return line
+        parts = [p.strip() for p in st.splitlines() if p.strip()]
+        return parts[-1] if parts else st
+    return st
+
+
+def map_original_service_to_service_type(service_type: str) -> str:
+    """Map Original Service / service_type to the Service type shipment column."""
+    label = _ups_original_service_label(service_type)
+    if not label:
+        return ''
+    norm = ' '.join(label.split()).upper()
+    return _ORIGINAL_SERVICE_TO_SERVICE_TYPE_NORM.get(norm, '')
+
+
+    return matrix_rows
+
+
+def is_empty_matrix_price(val) -> bool:
+    """True when a MainCosts matrix price cell has no usable cost value."""
+    if val is None:
+        return True
+    s = str(val).strip()
+    return not s
+
+
+def _forward_fill_matrix_row_prices(row: dict, category_specs) -> None:
+    """
+    For each cost block, copy the next non-empty weight-bracket price backward into
+    empty earlier brackets (e.g. missing ``<= 5.50`` gets the ``<= 6.0`` value).
+    """
+    for _cost_cat_name, blocks in category_specs:
+        for _weight_unit, weights, _row4_label in blocks:
+            for i, w in enumerate(weights):
+                key = (_cost_cat_name, w)
+                if not is_empty_matrix_price(row.get(key)):
+                    continue
+                for j in range(i + 1, len(weights)):
+                    next_key = (_cost_cat_name, weights[j])
+                    next_val = row.get(next_key)
+                    if not is_empty_matrix_price(next_val):
+                        row[key] = next_val
+                        break
+
+
+def apply_matrix_price_fill_rules(matrix_rows, category_specs) -> list:
+    """Forward-fill missing bracket prices and return the same row list."""
+    if not matrix_rows or not category_specs:
+        return matrix_rows
+    for row in matrix_rows:
+        _forward_fill_matrix_row_prices(row, category_specs)
+    return matrix_rows
+
+
+def row_has_matrix_prices_in_block(row: dict, cost_cat_name: str, weights) -> bool:
+    """True when a lane row has at least one price in the given cost-category block."""
+    return any(
+        not is_empty_matrix_price(row.get((cost_cat_name, w)))
+        for w in weights
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -288,9 +492,8 @@ def global_country(metadata):
         if country_words:
             return ' '.join(country_words).title()
 
-    # Fallback: return the last word of the carrier string
-    parts = carrier.split()
-    return parts[-1].title() if parts else ''
+    # Fallback: toolbox metadata often stores the country name directly (e.g. "Czech Republic").
+    return carrier.title()
 
 
 def _is_ups_maincosts_context(metadata, main_costs):
@@ -459,16 +662,17 @@ def _apply_plain_country_columns(row: dict, carrier: str) -> None:
     Set **Origin Country** / **Destination Country** only when the corresponding
     side has nothing in both Region and Postal Code Zone columns.
 
-    If either Region or Postal is set for that side, do not fill the plain country column.
+    Values are 2-letter ISO codes when the carrier country can be resolved.
     """
     row.setdefault('Origin Country', '')
     row.setdefault('Destination Country', '')
+    carrier_code = country_name_to_iso_code(carrier)
 
     ocr = (row.get('Origin Country Region') or '').strip()
     ocz = (row.get('Origin Postal Code Zone') or '').strip()
     if not ocr and not ocz:
         if not (row.get('Origin Country') or '').strip():
-            row['Origin Country'] = carrier or ''
+            row['Origin Country'] = carrier_code or ''
     else:
         if not (row.get('Origin Country') or '').strip():
             row['Origin Country'] = ''
@@ -477,7 +681,7 @@ def _apply_plain_country_columns(row: dict, carrier: str) -> None:
     dpz = (row.get('Destination Postal Code Zone') or '').strip()
     if not dcr and not dpz:
         if not (row.get('Destination Country') or '').strip():
-            row['Destination Country'] = carrier or ''
+            row['Destination Country'] = carrier_code or ''
     else:
         if not (row.get('Destination Country') or '').strip():
             row['Destination Country'] = ''
@@ -492,9 +696,10 @@ def build_ups_shipment_fields(service_type, zone_header_val, ups_layout, metadat
     Import (Receiving) → Origin Country Region; Export (Sending) → Destination Country Region.
     """
     out = {k: '' for k in MAIN_COSTS_SHIPMENT_COLS if k != 'Lane #'}
-    st_full = (service_type or '').strip()
+    st_full = _normalize_ups_service_type((service_type or '').strip())
     out['Original Service'] = st_full
     out['Service'] = st_full  # legacy key for downstream
+    out['Service type'] = map_original_service_to_service_type(st_full)
 
     col_labels = (ups_layout or {}).get('column_labels') or {}
     idx = _match_ups_zoning_column(st_full, col_labels)
@@ -521,6 +726,7 @@ def build_ups_shipment_fields(service_type, zone_header_val, ups_layout, metadat
     zone_title = f"{base} {direction_word} Zone {z_suffix}".strip() if z_suffix else f"{base} {direction_word} Zone".strip()
 
     carrier_ctry = global_country(metadata)
+    carrier_iso = country_name_to_iso_code(carrier_ctry)
     postal_style = _zone_semantic_belongs_in_postal_column(zone_title)
 
     if want_import:
@@ -534,9 +740,10 @@ def build_ups_shipment_fields(service_type, zone_header_val, ups_layout, metadat
         dcr = (out.get('Destination Country Region') or '').strip()
         dpz = (out.get('Destination Postal Code Zone') or '').strip()
         if not dcr and not dpz:
-            out['Destination Country'] = carrier_ctry
+            out['Destination Country'] = carrier_iso or ''
     else:
-        out['Origin Country Region'] = carrier_ctry
+        out['Origin Country'] = carrier_iso or ''
+        out['Origin Country Region'] = ''
         if postal_style:
             out['Destination Country Region'] = ''
             out['Destination Postal Code Zone'] = zone_title
@@ -987,7 +1194,7 @@ def _scan_category_merge_meta(main_costs):
         if _is_adder_section(rate_card):
             continue
 
-        service_type = (rate_card.get('service_type') or '').strip()
+        service_type = _normalize_ups_service_type((rate_card.get('service_type') or '').strip())
         cost_category_raw = rate_card.get('cost_category') or ''
         pricing = rate_card.get('pricing', [])
 
@@ -1049,7 +1256,7 @@ def build_matrix_main_costs(main_costs, metadata, zoning_matrix=None, country_zo
 
     for rate_card in main_costs:
         cost_category_raw = rate_card.get('cost_category') or ''
-        service_type = (rate_card.get('service_type') or '').strip()
+        service_type = _normalize_ups_service_type((rate_card.get('service_type') or '').strip())
         pricing = rate_card.get('pricing', [])
 
         if _is_adder_section(rate_card):
@@ -1144,7 +1351,7 @@ def build_matrix_main_costs(main_costs, metadata, zoning_matrix=None, country_zo
     prev_cost_category = None   # variant name for merging adder sections
 
     for rate_card in main_costs:
-        service_type = (rate_card.get('service_type') or '').strip()
+        service_type = _normalize_ups_service_type((rate_card.get('service_type') or '').strip())
         cost_category_raw = rate_card.get('cost_category') or ''
         zone_headers = rate_card.get('zone_headers', {})
         pricing = rate_card.get('pricing', [])
@@ -1204,6 +1411,7 @@ def build_matrix_main_costs(main_costs, metadata, zoning_matrix=None, country_zo
                         'Destination Postal Code Zone': '',
                         'Original Service': service_type,
                         'Service': service_type,
+                        'Service type': map_original_service_to_service_type(service_type),
                         'Zone': matrix_zone,
                         'Matrix zone': matrix_zone,
                     }
@@ -1226,6 +1434,8 @@ def build_matrix_main_costs(main_costs, metadata, zoning_matrix=None, country_zo
         row['Lane #'] = lane
 
         service = (row.get('Service') or row.get('Original Service') or '').strip()
+        if not (row.get('Service type') or '').strip():
+            row['Service type'] = map_original_service_to_service_type(service)
         matrix_zone = (row.get('Matrix zone') or row.get('Zone') or '').strip()
 
         if service.upper() == 'DHL EXPRESS DOMESTIC':
@@ -1247,6 +1457,7 @@ def build_matrix_main_costs(main_costs, metadata, zoning_matrix=None, country_zo
         _apply_plain_country_columns(row, carrier_last or '')
         rows.append(row)
 
+    apply_matrix_price_fill_rules(rows, category_specs)
     return rows, category_specs
 
 
