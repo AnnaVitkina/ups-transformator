@@ -403,7 +403,7 @@ def expand_main_costs_with_additional_zoning(xlsx_path, output_path=None):
     carrier_country_code = ''
     if 'Metadata' in wb.sheetnames:
         try:
-            from transform_main_costs import global_country
+            from transform_main_costs import global_country, country_name_to_iso_code
             from transform_other_tabs import _load_country_codes, _country_to_code
             ws_meta = wb['Metadata']
             for r in ws_meta.iter_rows(values_only=True):
@@ -412,8 +412,9 @@ def expand_main_costs_with_additional_zoning(xlsx_path, output_path=None):
                     carrier_country_name = global_country({'carrier': carrier_val})
                     if carrier_country_name:
                         carrier_country_code = (
-                            _country_to_code(carrier_country_name, _load_country_codes())
-                            or carrier_country_name
+                            country_name_to_iso_code(carrier_country_name)
+                            or _country_to_code(carrier_country_name, _load_country_codes())
+                            or ''
                         )
                     print(f"[*] expand_additional_zoning: carrier '{carrier_country_name}' -> '{carrier_country_code}'")
                     break
